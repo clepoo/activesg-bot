@@ -1,0 +1,371 @@
+"""
+ActiveSG Pickleball Booking Bot
+================================
+Weekdays  (Mon–Fri): tries Delta Outdoor Courts → CHIJ → Farrer Park at 19:00 / 20:00
+Weekends  (Sat–Sun): tries CHIJ at any available time
+
+Usage:
+    python bot.py                      # snipe for 7 days from today at 07:00 SGT
+    python bot.py --now                # book immediately from current slots
+    python bot.py --date 2026-05-10    # target a specific date
+    python bot.py --dry-run            # preview slots without booking
+"""
+
+import argparse
+import asyncio
+import logging
+import sys
+from datetime import datetime, timedelta, timezone
+
+import httpx
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+
+import config
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("bot.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("activesg-bot")
+
+BASE_URL       = "https://members.myactivesg.com"
+FACILITY_URL   = f"{BASE_URL}/facilities"
+SGT            = timezone(timedelta(hours=8))
+SLOT_OPEN_HOUR = 7
+
+
+# ── Helpers: weekday / weekend ─────────────────────────────────────────────────
+
+def is_weekday(dt: datetime) -> bool:
+    return dt.weekday() < 5   # 0=Mon … 4=Fri
+
+def venues_and_times(dt: datetime) -> tuple[list[str], list[str]]:
+    if is_weekday(dt):
+        log.info(f"{dt.strftime('%A')} → weekday rules: Delta / CHIJ / Farrer Park @ 19:00–20:00")
+        return config.WEEKDAY_VENUES, config.WEEKDAY_TIMES
+    else:
+        log.info(f"{dt.strftime('%A')} → weekend rules: CHIJ any time")
+        return config.WEEKEND_VENUES, config.WEEKEND_TIMES
+
+
+# ── Telegram ───────────────────────────────────────────────────────────────────
+
+async def notify(msg: str) -> None:
+    token = config.TELEGRAM_BOT_TOKEN
+    chat  = config.TELEGRAM_CHAT_ID
+    if not token or not chat:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(url, json={"chat_id": chat, "text": msg, "parse_mode": "HTML"})
+    except Exception as e:
+        log.warning(f"Telegram notify failed: {e}")
+
+
+# ── Browser actions ────────────────────────────────────────────────────────────
+
+async def login(page) -> bool:
+    log.info("Logging in …")
+    await page.goto(f"{BASE_URL}/auth/login", wait_until="domcontentloaded")
+    try:
+        await page.fill('input[name="email"], input[type="email"]', config.ACTIVESG_EMAIL)
+        await page.fill('input[name="password"], input[type="password"]', config.ACTIVESG_PASSWORD)
+        await page.click('button[type="submit"], input[type="submit"]')
+        await page.wait_for_load_state("networkidle", timeout=15_000)
+        if "auth/login" in page.url:
+            log.error("Login failed — still on login page.")
+            return False
+        log.info(f"Logged in → {page.url}")
+        return True
+    except Exception as e:
+        log.error(f"Login error: {e}")
+        return False
+
+
+async def navigate_to_activity(page, activity: str) -> bool:
+    log.info(f"Finding activity: {activity}")
+    await page.goto(FACILITY_URL, wait_until="domcontentloaded")
+    try:
+        loc = page.locator(f"text={activity}").first
+        await loc.wait_for(timeout=10_000)
+        await loc.click()
+        await page.wait_for_load_state("networkidle", timeout=15_000)
+        return True
+    except PWTimeout:
+        log.error(f"Activity '{activity}' not found.")
+        await page.screenshot(path="debug_activity.png")
+        return False
+
+
+async def select_venue(page, venues: list[str]) -> str | None:
+    for venue in venues:
+        try:
+            loc = page.locator(f"text={venue}").first
+            await loc.wait_for(timeout=5_000)
+            await loc.click()
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+            log.info(f"Venue: {venue}")
+            return venue
+        except PWTimeout:
+            log.warning(f"Venue '{venue}' not found, trying next …")
+    log.error("No preferred venues found.")
+    return None
+
+
+async def select_date(page, target: datetime) -> bool:
+    log.info(f"Selecting date: {target.strftime('%d/%m/%Y')}")
+    day = str(target.day)
+    try:
+        for _ in range(3):
+            try:
+                cell = page.locator("td[data-date], .calendar-day, td.day") \
+                           .filter(has_text=day).first
+                await cell.wait_for(timeout=3_000)
+                await cell.click()
+                await page.wait_for_load_state("networkidle", timeout=8_000)
+                return True
+            except PWTimeout:
+                try:
+                    await page.click(".next, .datepicker-next, [aria-label='Next month']",
+                                     timeout=3_000)
+                except PWTimeout:
+                    break
+        log.error("Could not select date.")
+        return False
+    except Exception as e:
+        log.error(f"Date selection error: {e}")
+        return False
+
+
+async def get_available_slots(page) -> list[dict]:
+    await page.wait_for_load_state("networkidle", timeout=10_000)
+    selectors = [
+        ".timeslot:not(.disabled):not(.booked)",
+        "td.available",
+        "[data-slot-status='available']",
+        "button.slot:not([disabled])",
+        ".slot-available",
+    ]
+    for sel in selectors:
+        items = await page.query_selector_all(sel)
+        if items:
+            slots = [{"label": (await el.inner_text()).strip(), "element": el}
+                     for el in items]
+            log.info(f"Found {len(slots)} slot(s) via '{sel}'")
+            return slots
+    log.warning("No slots found — saving debug screenshot.")
+    await page.screenshot(path="debug_slots.png")
+    return []
+
+
+async def pick_best_slot(slots: list[dict], preferred_times: list[str]) -> dict | None:
+    time_order = {t: i for i, t in enumerate(preferred_times)}
+    matched = []
+    for slot in slots:
+        for pt in preferred_times:
+            if pt in slot["label"] or pt.replace(":", "") in slot["label"].replace(":", ""):
+                matched.append((time_order[pt], slot))
+                break
+    if matched:
+        matched.sort(key=lambda x: x[0])
+        best = matched[0][1]
+        log.info(f"Best slot: {best['label']}")
+        return best
+    if slots:
+        log.info(f"No preferred time matched; using first available: {slots[0]['label']}")
+        return slots[0]
+    return None
+
+
+async def book_slot(page, slot: dict, dry_run: bool = False) -> bool:
+    log.info(f"{'[DRY RUN] ' if dry_run else ''}Booking: {slot['label']}")
+    if dry_run:
+        return True
+    try:
+        await slot["element"].click()
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+
+        for sel in ["button:has-text('Add to Cart')", "button:has-text('Book')",
+                    "button:has-text('Confirm')", "input[value='Book Now']"]:
+            try:
+                await page.click(sel, timeout=5_000)
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+                break
+            except PWTimeout:
+                continue
+
+        for sel in ["button:has-text('Checkout')", "a:has-text('Checkout')",
+                    "button:has-text('Proceed')"]:
+            try:
+                await page.click(sel, timeout=5_000)
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+                break
+            except PWTimeout:
+                continue
+
+        for sel in ["button:has-text('Confirm')", "button:has-text('Pay')",
+                    "button:has-text('Submit')", "input[value='Confirm']"]:
+            try:
+                await page.click(sel, timeout=5_000)
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+                break
+            except PWTimeout:
+                continue
+
+        body = await page.inner_text("body")
+        if any(k in body.lower() for k in
+               ["booking confirmed", "success", "receipt", "booking id",
+                "transaction", "booking reference"]):
+            log.info("✅ Booking confirmed!")
+            await page.screenshot(path="booking_success.png")
+            return True
+        log.warning("No confirmation text — check booking_uncertain.png")
+        await page.screenshot(path="booking_uncertain.png")
+        return False
+
+    except Exception as e:
+        log.error(f"Booking error: {e}")
+        await page.screenshot(path="booking_error.png")
+        return False
+
+
+# ── Sniper timing ──────────────────────────────────────────────────────────────
+
+async def snipe_wait(target: datetime) -> None:
+    open_time   = target.replace(hour=SLOT_OPEN_HOUR, minute=0, second=0,
+                                 microsecond=0, tzinfo=SGT)
+    warmup_time = open_time - timedelta(seconds=config.SNIPE_LEAD_SECONDS)
+    now  = datetime.now(SGT)
+    wait = (warmup_time - now).total_seconds()
+    if wait > 60:
+        log.info(f"Waiting {wait/60:.1f} min until warm-up …")
+        await asyncio.sleep(wait - 60)
+        log.info("T-60s: starting browser …")
+    elif wait > 0:
+        log.info(f"T-{wait:.0f}s: starting browser …")
+        await asyncio.sleep(wait)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+async def run(target_date: datetime, dry_run: bool = False, book_now: bool = False):
+    date_label = target_date.strftime("%a %d %b %Y")
+    venues, times = venues_and_times(target_date)
+
+    log.info(f"Target: {date_label}  |  Venues: {venues}  |  Times: {times}")
+
+    if not book_now:
+        await snipe_wait(target_date)
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=config.HEADLESS,
+            slow_mo=config.SLOW_MO,
+        )
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            locale="en-SG",
+            timezone_id="Asia/Singapore",
+        )
+        page = await context.new_page()
+
+        try:
+            if not await login(page):
+                await notify("❌ ActiveSG bot: login failed.")
+                return
+
+            if not await navigate_to_activity(page, config.ACTIVITY_KEYWORD):
+                await notify(f"❌ Could not find activity '{config.ACTIVITY_KEYWORD}'.")
+                return
+
+            # Try each venue in order until one books successfully
+            booked = False
+            for venue in venues:
+                log.info(f"--- Trying venue: {venue} ---")
+
+                # Re-navigate to activity listing each time we try a new venue
+                if not await navigate_to_activity(page, config.ACTIVITY_KEYWORD):
+                    continue
+
+                selected = await select_venue(page, [venue])
+                if not selected:
+                    continue
+
+                if not await select_date(page, target_date):
+                    continue
+
+                for attempt in range(config.MAX_RETRIES):
+                    slots = await get_available_slots(page)
+                    if slots:
+                        slot = await pick_best_slot(slots, times)
+                        if slot:
+                            success = await book_slot(page, slot, dry_run=dry_run)
+                            if success:
+                                msg = (
+                                    f"✅ <b>Pickleball booked!</b>\n"
+                                    f"📍 {venue}\n"
+                                    f"📅 {date_label}\n"
+                                    f"⏰ {slot['label']}"
+                                )
+                                log.info(msg)
+                                await notify(msg)
+                                booked = True
+                                break
+                            else:
+                                log.warning(f"Attempt {attempt+1} failed, retrying …")
+                        else:
+                            log.info(f"No matching time at {venue} — trying next venue.")
+                            break
+                    else:
+                        log.info(f"Attempt {attempt+1}/{config.MAX_RETRIES}: no slots yet, refreshing …")
+                        await page.reload(wait_until="networkidle")
+                        await asyncio.sleep(config.RETRY_DELAY)
+
+                if booked:
+                    break
+
+            if not booked:
+                msg = (f"😔 No pickleball slot booked for {date_label}.\n"
+                       f"Venues tried: {', '.join(venues)}\n"
+                       f"Times: {', '.join(times)}")
+                log.warning(msg)
+                await notify(msg)
+
+        except Exception as e:
+            log.exception(f"Unexpected error: {e}")
+            await notify(f"❌ ActiveSG bot crashed: {e}")
+            try:
+                await page.screenshot(path="crash.png")
+            except Exception:
+                pass
+        finally:
+            await context.close()
+            await browser.close()
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="ActiveSG Pickleball Bot")
+    p.add_argument("--date", help="Target date YYYY-MM-DD")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--now", action="store_true", help="Skip snipe wait, book immediately")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.date:
+        target = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=SGT)
+    else:
+        today  = datetime.now(SGT).replace(hour=0, minute=0, second=0, microsecond=0)
+        target = today + timedelta(days=config.DAYS_AHEAD)
+
+    asyncio.run(run(target_date=target, dry_run=args.dry_run, book_now=args.now))
